@@ -64,6 +64,8 @@ export interface RetryPolicy {
   statusRetries: number;
   /** attempts for connectivity failures (dropped internet) */
   networkRetries: number;
+  /** attempts when the model is connected but returns nothing usable */
+  emptyRetries: number;
   /** wall-clock ceiling for the status-retry sequence */
   statusDeadlineMs: number;
   /** wall-clock ceiling for the reconnect sequence */
@@ -83,6 +85,7 @@ export function retryPolicyFromEnv(env: Record<string, unknown> | undefined): Re
   return {
     statusRetries: intEnv(env, "UPSTREAM_RETRIES", 3, 1, 20),
     networkRetries: intEnv(env, "UPSTREAM_NETWORK_RETRIES", 150, 1, 1000),
+    emptyRetries: intEnv(env, "UPSTREAM_EMPTY_RETRIES", 30, 0, 200),
     statusDeadlineMs: intEnv(env, "UPSTREAM_TOTAL_DEADLINE_MS", 90_000, 1_000, 3_600_000),
     networkDeadlineMs: intEnv(env, "UPSTREAM_NETWORK_DEADLINE_MS", 900_000, 1_000, 3_600_000),
     networkDelayCapMs: intEnv(env, "UPSTREAM_NETWORK_DELAY_CAP_MS", 5_000, 100, 60_000),
@@ -90,3 +93,11 @@ export function retryPolicyFromEnv(env: Record<string, unknown> | undefined): Re
 }
 
 export const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Backoff between retries of an empty answer. Short — the model is reachable and
+ * the point is to give it another roll of the dice, not to wait out an outage.
+ */
+export function emptyRetryDelay(attempt: number): number {
+  return Math.min(400 * attempt, 3_000) + Math.floor(Math.random() * 250);
+}

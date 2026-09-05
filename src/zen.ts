@@ -157,8 +157,12 @@ export async function zenHeaders(
   return { headers, version };
 }
 
-/** Default deadline for zen to send response headers. Overridable via UPSTREAM_HEADER_TIMEOUT_MS. */
-export const DEFAULT_HEADER_TIMEOUT_MS = 20_000;
+/**
+ * Deadline for zen to send response headers. Generous on purpose: reasoning
+ * models can think for minutes before the first byte, and some upstreams do not
+ * flush headers until generation starts. Overridable via UPSTREAM_HEADER_TIMEOUT_MS.
+ */
+export const DEFAULT_HEADER_TIMEOUT_MS = 120_000;
 
 export function numEnv(env: Record<string, unknown> | undefined, key: string, fallback: number): number {
   const v = env?.[key];

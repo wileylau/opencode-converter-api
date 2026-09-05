@@ -14,12 +14,17 @@ import { callZen, pickEndpoint, classifyModel, fetchZenModels, ZenError, numEnv,
 import { mapperForRequest, remapCanonicalResponse, remapEvents, ToolNameMapper } from "./tools";
 import {
   classifyFailure,
+  emptyRetryDelay,
   isConnectivityFailure,
   networkRetryDelay,
   retryPolicyFromEnv,
   sleep,
   statusRetryDelay,
 } from "./retry";
+import { isReasoningRejection, lowerEffort, planMaxEffort, type Effort } from "./reasoning";
+
+/** tool_choice repair + one step per reasoning level */
+const MAX_REPAIR_PASSES = 8;
 import { jsonResponse, sseResponse, randomId } from "./util";
 
 export type InboundFormat = PublicFormat;
@@ -146,6 +151,13 @@ export function promoteReasoningIfEmpty(c: CanonicalResponse): CanonicalResponse
   // replace the reasoning outputs: clients that render reasoning would otherwise
   // show the same content twice
   return { ...c, output: [{ type: "text", text: reasoning }] };
+}
+
+/** True when a response carries something a client can actually show or act on. */
+export function hasUsableOutput(c: CanonicalResponse): boolean {
+  return c.output.some(
+    (o) => (o.type === "text" && o.text.trim().length > 0) || o.type === "tool_call" || (o.type === "reasoning" && o.text.trim().length > 0),
+  );
 }
 
 /** Streaming counterpart: emits the buffered reasoning as text just before stop. */
@@ -289,6 +301,13 @@ export async function handleCompletion(h: HandlerEnv): Promise<Response> {
   const wantsStream = req.stream;
   const target = pickEndpoint(req.model, families, wantsStream, zenBaseFromEnv(h.env));
 
+  // Always run the model at the highest reasoning level it supports; an
+  // unsupported level is corrected by the repair chain on the first 400.
+  if (String(h.env.FORCE_MAX_REASONING ?? "1") !== "0") {
+    const plan = planMaxEffort(req.model);
+    req = { ...req, reasoningEffort: plan.effort };
+  }
+
   const toolMapper: ToolNameMapper = mapperForRequest(req);
 
   try {
@@ -299,6 +318,8 @@ export async function handleCompletion(h: HandlerEnv): Promise<Response> {
     // muse rejects forced tool_choice). On a recognizable 400, rebuild once.
     for (let pass = 0; ; pass++) {
       const reconnectBudget: ReconnectBudget = { used: 0 };
+      /** attempts spent because the model answered with nothing usable */
+      const emptyBudget: ReconnectBudget = { used: 0 };
       const zenCallOptions = {
         auth: { apiKey: h.auth.apiKey, anonymous: !h.auth.apiKey },
         body: bodyStr,
@@ -311,15 +332,27 @@ export async function handleCompletion(h: HandlerEnv): Promise<Response> {
       };
       const firstCall = await callZenWithRetry(zenCallOptions, h.env, reconnectBudget);
       const { version, attempts } = firstCall;
-      const response = firstCall.response;
+      let response = firstCall.response;
       let upstreamController = firstCall.controller;
+
+      /**
+       * Give the model more room before retrying an empty answer: reasoning-heavy
+       * models can spend the whole budget thinking and return nothing visible.
+       */
+      const escalateTokenBudget = (): boolean => {
+        const current = effectiveReq.maxTokens;
+        if (!current || current >= 200_000) return false;
+        effectiveReq = { ...effectiveReq, maxTokens: Math.min(200_000, Math.max(2_048, current * 2)) };
+        zenCallOptions.body = JSON.stringify(buildZenRequestBody(target.endpoint, effectiveReq, wantsStream, toolMapper));
+        return true;
+      };
 
     // Upstream error: nothing has been sent downstream yet, so normalize to a
     // clean error response regardless of whether the client asked for a stream.
     if (!response.ok) {
       const text = await streamToTextSafe(response);
       const zenErr = zenErrorFromText(response.status, text, response.headers.get("retry-after"));
-      const repaired = pass === 0 ? repairRequest(effectiveReq, zenErr) : null;
+      const repaired = pass < MAX_REPAIR_PASSES ? repairRequest(effectiveReq, zenErr) : null;
       if (repaired) {
         effectiveReq = repaired;
         bodyStr = JSON.stringify(buildZenRequestBody(target.endpoint, effectiveReq, wantsStream, toolMapper));
@@ -380,10 +413,29 @@ export async function handleCompletion(h: HandlerEnv): Promise<Response> {
       }
       if (bodyTimer) clearTimeout(bodyTimer);
       canonical = promoteReasoningIfEmpty(remapCanonicalResponse(canonical, toolMapper));
+
+      // The model can be perfectly healthy and still return nothing usable
+      // (all tokens burned on internal thinking). Retry with a bigger budget.
+      while (!hasUsableOutput(canonical) && emptyBudget.used < policy.emptyRetries && !h.signal?.aborted) {
+        emptyBudget.used += 1;
+        escalateTokenBudget();
+        await sleep(emptyRetryDelay(emptyBudget.used));
+        const retryCall = await callZenWithRetry(zenCallOptions, h.env, reconnectBudget);
+        response = retryCall.response;
+        upstreamController = retryCall.controller;
+        if (!response.ok) break;
+        try {
+          canonical = promoteReasoningIfEmpty(remapCanonicalResponse(await readBody(response), toolMapper));
+        } catch {
+          break;
+        }
+      }
+
       const headers: Record<string, string> = {
         "x-opencode-converter-version": version,
         "x-opencode-upstream": target.endpoint,
         ...(reconnectBudget.used ? { "x-opencode-reconnects": String(reconnectBudget.used) } : {}),
+        ...(emptyBudget.used ? { "x-opencode-empty-retries": String(emptyBudget.used) } : {}),
       };
       return jsonResponse(canonicalToPublic(h.format, canonical), 200, headers);
     }
@@ -436,7 +488,7 @@ export async function handleCompletion(h: HandlerEnv): Promise<Response> {
 
     const parse = streamParserFor(target.endpoint);
     const policy = retryPolicyFromEnv(h.env);
-    const stallTimeoutMs = numEnv(h.env, "UPSTREAM_STALL_TIMEOUT_MS", 60_000);
+    const stallTimeoutMs = numEnv(h.env, "UPSTREAM_STALL_TIMEOUT_MS", 300_000);
     const streamDeadlineMs = numEnv(h.env, "STREAM_DEADLINE_MS", 570_000);
     const secs = (ms: number) => Math.max(1, Math.round(ms / 1000));
 
@@ -458,18 +510,49 @@ export async function handleCompletion(h: HandlerEnv): Promise<Response> {
     /** true once any byte reached the client — after that a restart would duplicate output */
     let enqueuedAny = false;
 
+    /** set by the stall watchdog to force a restart that isn't a real disconnect */
+    let stallRestart = false;
+    /** anything visible (text / tool call / reasoning) seen on the current attempt */
+    let sawUsable = false;
+
+    /** Reopen the upstream request and reset per-attempt state. Nothing has been sent. */
+    const reopenUpstream = async (): Promise<void> => {
+      const reopened = await callZenWithRetry(zenCallOptions, h.env, reconnectBudget);
+      if (!reopened.response.ok || !reopened.response.body) {
+        const text = await streamToTextSafe(reopened.response);
+        throw zenErrorFromText(reopened.response.status, text, reopened.response.headers.get("retry-after"));
+      }
+      activeBody = reopened.response.body;
+      activeController = reopened.controller;
+      emit = makeEmitter();
+      emptyGuard = makeEmptyStreamGuard();
+      sawUsable = false;
+    };
+
     /**
-     * Raw upstream events. If the connection drops before the client received
-     * anything, the request is transparently reopened (bounded by the shared
-     * reconnect budget) and the stream starts over.
+     * Raw upstream events, with two kinds of transparent restart — both only
+     * possible while the client has received nothing, so nothing is ever replayed:
+     *   1. the connection dropped (counts against the reconnect budget)
+     *   2. the model produced no usable output, or went silent long enough for the
+     *      stall watchdog to fire (counts against the empty-answer budget)
      */
     const source: AsyncGenerator<CanonicalEvent> = (async function* () {
       for (;;) {
         try {
-          for await (const ev of remapEvents(parse(activeBody), toolMapper)) yield ev;
-          return;
+          for await (const ev of remapEvents(parse(activeBody), toolMapper)) {
+            if (ev.type === "text_delta" || ev.type === "tool_call_start" || ev.type === "reasoning_delta") sawUsable = true;
+            yield ev;
+          }
         } catch (err) {
           const cls = classifyFailure(err, Boolean(h.signal?.aborted));
+          if (stallRestart) {
+            // the watchdog aborted this attempt on purpose
+            stallRestart = false;
+            await sleep(emptyRetryDelay(emptyBudget.used));
+            escalateTokenBudget();
+            await reopenUpstream();
+            continue;
+          }
           const canRestart =
             isConnectivityFailure(cls) &&
             !enqueuedAny &&
@@ -479,16 +562,19 @@ export async function handleCompletion(h: HandlerEnv): Promise<Response> {
 
           reconnectBudget.used += 1;
           await sleep(networkRetryDelay(reconnectBudget.used, policy.networkDelayCapMs));
-          const reopened = await callZenWithRetry(zenCallOptions, h.env, reconnectBudget);
-          if (!reopened.response.ok || !reopened.response.body) {
-            const text = await streamToTextSafe(reopened.response);
-            throw zenErrorFromText(reopened.response.status, text, reopened.response.headers.get("retry-after"));
-          }
-          activeBody = reopened.response.body;
-          activeController = reopened.controller;
-          emit = makeEmitter();
-          emptyGuard = makeEmptyStreamGuard();
+          await reopenUpstream();
+          continue;
         }
+
+        // upstream finished. If it produced nothing the client could use and we
+        // have not sent a byte yet, roll the dice again with a bigger budget.
+        const retryEmpty =
+          !sawUsable && !enqueuedAny && !h.signal?.aborted && emptyBudget.used < policy.emptyRetries;
+        if (!retryEmpty) return;
+        emptyBudget.used += 1;
+        escalateTokenBudget();
+        await sleep(emptyRetryDelay(emptyBudget.used));
+        await reopenUpstream();
       }
     })();
 
@@ -513,11 +599,15 @@ export async function handleCompletion(h: HandlerEnv): Promise<Response> {
     // pull() is called whenever the consumer wants more data. It returns only
     // after enqueueing at least one chunk (or terminating), because a pull that
     // enqueues nothing is not guaranteed to be retried by the runtime.
+    /** in-flight source.next(), kept across pulls so a stall never orphans it */
+    let pendingNext: Promise<IteratorResult<CanonicalEvent>> | null = null;
+
     const output = new ReadableStream<Uint8Array>({
       async pull(dst) {
         try {
           for (;;) {
-            const nextPromise = source.next();
+            const nextPromise = pendingNext ?? source.next();
+            pendingNext = nextPromise;
             // the loser of the race must never reject unobserved
             nextPromise.catch(() => {});
             let stallTimer: ReturnType<typeof setTimeout> | undefined;
@@ -534,15 +624,25 @@ export async function handleCompletion(h: HandlerEnv): Promise<Response> {
             } finally {
               if (stallTimer) clearTimeout(stallTimer);
             }
+            // the pending promise is only settled when the event won the race
+            if (result !== null) pendingNext = null;
 
             if (result === null) {
-              // stalled: kill the upstream connection and report cleanly
+              // Silent upstream. While the client has received nothing we can
+              // simply start the attempt over (models that think for a long time
+              // internally look identical to a hang from out here).
+              if (!enqueuedAny && emptyBudget.used < policy.emptyRetries && !h.signal?.aborted) {
+                emptyBudget.used += 1;
+                stallRestart = true;
+                upstreamAbort(new DOMException(`no output for ${secs(stallTimeoutMs)}s — restarting attempt`, "TimeoutError"));
+                continue;
+              }
               upstreamAbort(new DOMException(`zen sent nothing for ${secs(stallTimeoutMs)}s`, "TimeoutError"));
               for (const e of emit({
                 type: "error",
                 error: {
                   type: "upstream_stalled",
-                  message: `opencode zen stopped sending data for ${secs(stallTimeoutMs)}s — stream aborted. Try again or use a different model.`,
+                  message: `opencode zen stopped sending data for ${secs(stallTimeoutMs)}s (after ${emptyBudget.used} restart attempt(s)) — stream aborted. Try again or use a different model.`,
                 },
               }))
                 dst.enqueue(e);
@@ -632,9 +732,20 @@ export async function handleCompletion(h: HandlerEnv): Promise<Response> {
  * Known upstream constraints (probed 2026-09-04):
  *   - muse (Meta upstream) rejects tool_choice other than "auto".
  */
+/**
+ * Rebuild a request the upstream rejected with a 400.
+ * Known constraints: muse-class models accept only `tool_choice: "auto"`, and
+ * reasoning levels differ per model — an unsupported effort steps down the chain
+ * (max → xhigh → high → medium → low → minimal → none → dropped).
+ */
 function repairRequest(req: CanonicalRequest, err: ZenError): CanonicalRequest | null {
   const msg = err.message ?? "";
-  if (err.status === 400 && /tool_choice/i.test(msg) && req.toolChoice !== "auto") {
+  if (err.status !== 400) return null;
+  if (isReasoningRejection(msg) && req.reasoningEffort) {
+    const next = lowerEffort(req.reasoningEffort as Effort);
+    return { ...req, reasoningEffort: next };
+  }
+  if (/tool_choice/i.test(msg) && req.toolChoice !== "auto") {
     return { ...req, toolChoice: "auto" };
   }
   return null;

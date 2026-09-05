@@ -5,6 +5,7 @@
 import type { CanonicalRequest, CanonicalMessage, ContentBlock, ToolDefinition } from "../canonical";
 import type { ZenEndpoint } from "../zen";
 import { ToolNameMapper } from "../tools";
+import { effortBudgetTokens, effortForOpenAi } from "../reasoning";
 
 const A = (m: ToolNameMapper | undefined, name: string): string => (m ? m.alias(name) : name);
 
@@ -19,17 +20,13 @@ export function b64OrUrl(block: Extract<ContentBlock, { type: "image" | "audio" 
 }
 
 function effortValue(effort: CanonicalRequest["reasoningEffort"], endpoint: ZenEndpoint): unknown {
-  if (!effort) return undefined;
+  if (!effort || effort === "none") return effort === "none" && endpoint !== "messages" ? "none" : undefined;
   switch (endpoint) {
     case "chat":
-      return effort === "minimal" ? "low" : effort; // "reasoning_effort": low|medium|high
     case "responses":
-      return effort === "minimal" ? "low" : effort;
-    case "messages": {
-      // anthropic budget_tokens maps effort → token budget
-      const budgets: Record<string, number> = { minimal: 1024, low: 2048, medium: 8192, high: 24576 };
-      return budgets[effort] ?? 8192;
-    }
+      return effortForOpenAi(effort);
+    case "messages":
+      return effortBudgetTokens(effort);
     case "gemini":
       // gemini uses generationConfig.thinkingConfig.thinkingBudget; handled in buildGeminiBody
       return undefined;
@@ -296,11 +293,18 @@ export function buildAnthropicBody(req: CanonicalRequest, stream: boolean, tm?: 
               : { type: "tool", name: A(tm, req.toolChoice.name) };
     }
   }
-  if (req.reasoningEffort) {
-    body["thinking"] = { type: "enabled", budget_tokens: effortValue(req.reasoningEffort, "messages") };
-    // anthropic requires temperature=1 and forbids top_p with thinking
-    body["temperature"] = 1;
-    delete body["top_p"];
+  if (req.reasoningEffort && req.reasoningEffort !== "none") {
+    // anthropic requires budget_tokens < max_tokens, so clamp (and skip thinking
+    // entirely when the caller's budget leaves no room for it)
+    const maxTokens = (body["max_tokens"] as number) ?? 4096;
+    const want = effortBudgetTokens(req.reasoningEffort);
+    const budget = Math.min(want, Math.max(0, maxTokens - 1024));
+    if (budget >= 1024) {
+      body["thinking"] = { type: "enabled", budget_tokens: budget };
+      // anthropic requires temperature=1 and forbids top_p with thinking
+      body["temperature"] = 1;
+      delete body["top_p"];
+    }
   }
   return body;
 }
@@ -522,9 +526,11 @@ export function buildGeminiBody(req: CanonicalRequest, stream: boolean, tm?: Too
     };
   }
   if (req.reasoningEffort) {
-    const budgets: Record<string, number> = { minimal: 512, low: 2048, medium: 8192, high: 24576 };
     const generation = (body["generationConfig"] as Record<string, unknown> | undefined) ?? {};
-    generation["thinkingConfig"] = { thinkingBudget: budgets[req.reasoningEffort] ?? 8192 };
+    generation["thinkingConfig"] =
+      req.reasoningEffort === "none"
+        ? { thinkingBudget: 0 }
+        : { thinkingBudget: effortBudgetTokens(req.reasoningEffort), includeThoughts: true };
     body["generationConfig"] = generation;
   }
   void stream;

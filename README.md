@@ -141,6 +141,31 @@ Agent clients send payloads that zen's upstreams reject outright. The converter 
 - **Per-family constraints** — when an upstream rejects a mapped param (e.g. Meta's muse models accept only `tool_choice: "auto"`), the request is rebuilt once without it and retried automatically instead of failing.
 - **Empty-answer recovery** — muse-class models sometimes stream the entire answer as *reasoning* and end with an empty visible message; clients that hide reasoning then show nothing. The converter also captures text that upstreams deliver only in `done`/`completed` events (skipping normal deltas), and if a response would arrive with reasoning but no visible text and no tool calls, the reasoning content is promoted to a normal text reply.
 
+## Maximum reasoning, always
+
+Every request runs the model at the **highest reasoning level it supports**, descending only if the upstream rejects it:
+
+```
+max → xhigh → high → medium → low → minimal → none → (no reasoning params)
+```
+
+The starting level comes from a built-in table of what each zen model advertises (`gpt-5.6-*` and `claude-opus-5` → `max`, `muse-spark-*` → `xhigh`, `gemini-*` → `high`, and so on). Models with no reasoning support get no reasoning parameters at all. For a model the table doesn't know, the converter starts at `max` and steps down one level per upstream rejection, so a new model costs one extra round trip instead of a failed request. Each dialect gets the setting in its own shape: `reasoning_effort` for chat, `reasoning.effort` for Responses, `thinking.budget_tokens` for Anthropic (clamped below `max_tokens`, and skipped when there is no room), `thinkingConfig.thinkingBudget` for Gemini.
+
+Set `FORCE_MAX_REASONING=0` to respect whatever the client asked for instead.
+
+## When the model thinks but says nothing
+
+Reasoning-heavy models routinely burn their whole token budget on internal thinking and return an empty answer, or go quiet for minutes before the first byte. Those are treated as retryable, not as failures:
+
+| Situation | Behavior |
+|---|---|
+| No response headers yet | wait up to **120 s** (`UPSTREAM_HEADER_TIMEOUT_MS`), then reconnect |
+| Connected, no data yet | wait up to **300 s** (`UPSTREAM_STALL_TIMEOUT_MS`), then restart the attempt |
+| Answer arrives with no text, tool calls, or reasoning | restart the attempt |
+| Restart budget | **30 attempts** (`UPSTREAM_EMPTY_RETRIES`) |
+
+Each restart doubles the token budget (from 2 048 up to 200 000), because the usual cause is reasoning consuming everything before the visible answer starts. Restarts only happen while your client has received nothing, so output is never duplicated; successful requests report the count in `x-opencode-empty-retries`.
+
 ## Surviving a dropped internet connection
 
 Connectivity failures get their own, much larger budget than "upstream is busy" failures, because the right response to a dead network is patient reconnection:

@@ -189,9 +189,18 @@ export function parseChatCompletionsRequest(body: Record<string, unknown>): Cano
 
 function normalizeEffort(v: unknown): ReasoningEffort | undefined {
   if (typeof v !== "string") return undefined;
-  if (v === "minimal" || v === "low" || v === "medium" || v === "high") return v;
-  if (v === "xhigh" || v === "max") return "high";
-  return undefined;
+  switch (v) {
+    case "none":
+    case "minimal":
+    case "low":
+    case "medium":
+    case "high":
+    case "xhigh":
+    case "max":
+      return v;
+    default:
+      return undefined;
+  }
 }
 
 function pickNumber(v: unknown): number | null {

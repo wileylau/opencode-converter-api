@@ -42,7 +42,7 @@ export type ContentBlock =
 
 // ---------- reasoning ----------
 
-export type ReasoningEffort = "minimal" | "low" | "medium" | "high";
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 // ---------- messages ----------
 

@@ -409,7 +409,7 @@ describe("review-fix regressions", () => {
   it("anthropic thinking blocks round-trip with signature", () => {
     const req = parseAnthropicRequest({
       model: "claude-haiku-4-5",
-      max_tokens: 100,
+      max_tokens: 8000,
       thinking: { type: "enabled", budget_tokens: 4096 },
       messages: [
         { role: "user", content: "q" },
@@ -768,5 +768,88 @@ describe("connection-drop retry policy", () => {
     expect(statusRetryDelay(1, 600)).toBe(30_000);
     expect(statusRetryDelay(1)).toBeLessThanOrEqual(9_000);
     expect(statusRetryDelay(5)).toBeLessThanOrEqual(9_000);
+  });
+});
+
+describe("maximum reasoning effort", () => {
+  it("picks the highest advertised level per model and steps down on rejection", async () => {
+    const { planMaxEffort, lowerEffort, isReasoningRejection, EFFORT_CHAIN } = await import("../src/reasoning");
+    expect(planMaxEffort("gpt-5.6-sol").effort).toBe("max");
+    expect(planMaxEffort("muse-spark-1.3-contributor-free").effort).toBe("xhigh");
+    expect(planMaxEffort("gemini-3-flash").effort).toBe("high");
+    expect(planMaxEffort("claude-opus-4-5").effort).toBe("high");
+    // models with no reasoning support get no reasoning controls at all
+    expect(planMaxEffort("qwen3-coder").effort).toBeUndefined();
+    expect(planMaxEffort("big-pickle").effort).toBeUndefined();
+    // unknown/new model: start at the ceiling and let the chain correct it
+    expect(planMaxEffort("gpt-9-brand-new").effort).toBe("max");
+
+    expect(EFFORT_CHAIN[0]).toBe("max");
+    expect(lowerEffort("max")).toBe("xhigh");
+    expect(lowerEffort("xhigh")).toBe("high");
+    expect(lowerEffort("high")).toBe("medium");
+    expect(lowerEffort("medium")).toBe("low");
+    expect(lowerEffort("low")).toBe("minimal");
+    expect(lowerEffort("minimal")).toBe("none");
+    expect(lowerEffort("none")).toBeUndefined();
+
+    expect(isReasoningRejection("only 'high' is supported for reasoning.effort")).toBe(true);
+    expect(isReasoningRejection("budget_tokens must be less than max_tokens")).toBe(true);
+    expect(isReasoningRejection("unknown parameter logprobs")).toBe(false);
+  });
+
+  it("sends the effort in each dialect's own shape", async () => {
+    const chat = parseChatCompletionsRequest({ model: "gpt-5.6-sol", messages: [{ role: "user", content: "hi" }], reasoning_effort: "max" });
+    expect((buildZenRequestBody("chat", chat, false) as { reasoning_effort: string }).reasoning_effort).toBe("max");
+
+    const resp = parseResponsesRequest({ model: "gpt-5.6-sol", input: "hi", reasoning: { effort: "xhigh" } });
+    expect((buildZenRequestBody("responses", resp, false) as { reasoning: { effort: string } }).reasoning.effort).toBe("xhigh");
+
+    const gem = parseChatCompletionsRequest({ model: "gemini-3-flash", messages: [{ role: "user", content: "hi" }], reasoning_effort: "high" });
+    const gemBody = buildZenRequestBody("gemini", gem, false) as { generationConfig: { thinkingConfig: { thinkingBudget: number; includeThoughts?: boolean } } };
+    expect(gemBody.generationConfig.thinkingConfig.thinkingBudget).toBeGreaterThan(8000);
+    expect(gemBody.generationConfig.thinkingConfig.includeThoughts).toBe(true);
+  });
+
+  it("clamps the anthropic thinking budget below max_tokens and skips it when there is no room", () => {
+    const roomy = parseAnthropicRequest({
+      model: "claude-opus-5",
+      max_tokens: 40_000,
+      thinking: { type: "enabled", budget_tokens: 30_000 },
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const roomyBody = buildZenRequestBody("messages", { ...roomy, reasoningEffort: "max" }, false) as {
+      thinking?: { budget_tokens: number };
+      max_tokens: number;
+    };
+    expect(roomyBody.thinking!.budget_tokens).toBeLessThan(roomyBody.max_tokens);
+
+    const tight = parseAnthropicRequest({
+      model: "claude-opus-5",
+      max_tokens: 512,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const tightBody = buildZenRequestBody("messages", { ...tight, reasoningEffort: "max" }, false) as { thinking?: unknown };
+    expect(tightBody.thinking).toBeUndefined();
+  });
+
+  it("defaults to 30 empty-answer retries", async () => {
+    const { retryPolicyFromEnv, emptyRetryDelay } = await import("../src/retry");
+    expect(retryPolicyFromEnv({}).emptyRetries).toBe(30);
+    expect(retryPolicyFromEnv({ UPSTREAM_EMPTY_RETRIES: 5 }).emptyRetries).toBe(5);
+    expect(retryPolicyFromEnv({ UPSTREAM_EMPTY_RETRIES: 0 }).emptyRetries).toBe(0);
+    expect(emptyRetryDelay(1)).toBeLessThan(1_000);
+    expect(emptyRetryDelay(50)).toBeLessThanOrEqual(3_300);
+  });
+
+  it("treats reasoning-only and empty responses correctly for the retry decision", async () => {
+    const { hasUsableOutput } = await import("../src/pipeline");
+    expect(hasUsableOutput({ id: "a", model: "m", output: [], stopReason: "end", created: 1 })).toBe(false);
+    expect(hasUsableOutput({ id: "a", model: "m", output: [{ type: "text", text: "   " }], stopReason: "end", created: 1 })).toBe(false);
+    expect(hasUsableOutput({ id: "a", model: "m", output: [{ type: "text", text: "hi" }], stopReason: "end", created: 1 })).toBe(true);
+    expect(hasUsableOutput({ id: "a", model: "m", output: [{ type: "reasoning", text: "thought" }], stopReason: "end", created: 1 })).toBe(true);
+    expect(
+      hasUsableOutput({ id: "a", model: "m", output: [{ type: "tool_call", id: "c", name: "f", argumentsJson: "{}" }], stopReason: "end", created: 1 }),
+    ).toBe(true);
   });
 });
