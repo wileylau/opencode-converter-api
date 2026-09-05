@@ -1,0 +1,18 @@
+name = "opencode-converter-api"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+# No secrets here: every caller supplies their own zen API key via
+# Authorization. Optional shared gate:
+#   npx wrangler secret put GATEWAY_KEY
+# Optional default key used when a caller sends none (free models only):
+#   npx wrangler secret put DEFAULT_ZEN_KEY
+
+[observability]
+enabled = true
+
+# Note: [limits] cpu_ms is a paid-plan-only setting (Free deploys fail with
+# error 100328). Waiting on the upstream costs no CPU, but per-event conversion
+# does (~12 µs/event), so very long streams can approach the Free 10 ms budget.
+# On a paid plan add:  [limits]\n cpu_ms = 30000

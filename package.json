@@ -1,0 +1,19 @@
+{
+  "name": "opencode-converter-api",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker that exposes opencode zen behind OpenAI, Anthropic, and OpenAI-Responses compatible APIs, presenting itself as the opencode CLI",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --port 8787",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260904.1",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4",
+    "wrangler": "^4.129.0"
+  }
+}
