@@ -864,10 +864,12 @@ describe("geo-block retry", () => {
     expect(isGeoBlockMessage("Rate limit exceeded.")).toBe(false);
   });
 
-  it("defaults to 4 geo-block retries", async () => {
+  it("retries geo-blocks without a cap unless configured", async () => {
     const { retryPolicyFromEnv } = await import("../src/retry");
-    expect(retryPolicyFromEnv({}).geoBlockRetries).toBe(4);
+    expect(retryPolicyFromEnv({}).geoBlockRetries).toBe(Number.POSITIVE_INFINITY);
     expect(retryPolicyFromEnv({ UPSTREAM_GEOBLOCK_RETRIES: 9 }).geoBlockRetries).toBe(9);
     expect(retryPolicyFromEnv({ UPSTREAM_GEOBLOCK_RETRIES: 0 }).geoBlockRetries).toBe(0);
+    expect(retryPolicyFromEnv({ UPSTREAM_GEOBLOCK_RETRIES: "" }).geoBlockRetries).toBe(Number.POSITIVE_INFINITY);
+    expect(retryPolicyFromEnv({ UPSTREAM_GEOBLOCK_RETRIES: "-1" }).geoBlockRetries).toBe(Number.POSITIVE_INFINITY);
   });
 });

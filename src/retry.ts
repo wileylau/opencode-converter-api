@@ -19,7 +19,9 @@ const SUBREQUEST_MESSAGE = /too many subrequests|subrequest limit/i;
 /**
  * Region-block messages arrive with 401/403 (which look permanent) but are
  * frequently transient: the same session works seconds later because zen's
- * provider pool rotates nodes. Worth retrying a few times before giving up.
+ * provider pool rotates nodes. By default these are retried forever — an
+ * intermittent block that clears on the next attempt must not kill a turn.
+ * Set UPSTREAM_GEOBLOCK_RETRIES to a number to cap it.
  */
 const GEO_BLOCK_MESSAGE = /(not available in your country|not available in your region|geo[- ]?block|region[- ]?block|country|embargo|sanction|unavailable in your)/i;
 
@@ -77,7 +79,11 @@ export interface RetryPolicy {
   networkRetries: number;
   /** attempts when the model is connected but returns nothing usable */
   emptyRetries: number;
-  /** attempts for intermittent region blocks behind 401/403 */
+  /**
+   * attempts for intermittent region blocks behind 401/403.
+   * Infinity (the default) means retry until the block clears or the caller
+   * disconnects — set UPSTREAM_GEOBLOCK_RETRIES to cap it.
+   */
   geoBlockRetries: number;
   /** wall-clock ceiling for the status-retry sequence */
   statusDeadlineMs: number;
@@ -94,12 +100,28 @@ function intEnv(env: Record<string, unknown> | undefined, key: string, fallback:
   return Math.min(max, Math.max(min, Math.round(n)));
 }
 
+/**
+ * Reads an attempt budget that allows "infinity" (unset / empty / "inf" /
+ * negative → unbounded), with a numeric cap when the user sets one.
+ */
+function unboundedEnv(env: Record<string, unknown> | undefined, key: string, max: number): number {
+  const raw = env?.[key];
+  if (raw === undefined || raw === null || raw === "") return Number.POSITIVE_INFINITY;
+  if (typeof raw === "string" && /^(inf(inity)?|unbounded|unlimited|-?\d+)$/i.test(raw.trim()) && Number(raw) < 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return Number.POSITIVE_INFINITY;
+  if (n < 0) return Number.POSITIVE_INFINITY;
+  return Math.min(max, Math.round(n));
+}
+
 export function retryPolicyFromEnv(env: Record<string, unknown> | undefined): RetryPolicy {
   return {
     statusRetries: intEnv(env, "UPSTREAM_RETRIES", 3, 1, 20),
     networkRetries: intEnv(env, "UPSTREAM_NETWORK_RETRIES", 150, 1, 1000),
     emptyRetries: intEnv(env, "UPSTREAM_EMPTY_RETRIES", 30, 0, 200),
-    geoBlockRetries: intEnv(env, "UPSTREAM_GEOBLOCK_RETRIES", 4, 0, 20),
+    geoBlockRetries: unboundedEnv(env, "UPSTREAM_GEOBLOCK_RETRIES", 10_000),
     statusDeadlineMs: intEnv(env, "UPSTREAM_TOTAL_DEADLINE_MS", 90_000, 1_000, 3_600_000),
     networkDeadlineMs: intEnv(env, "UPSTREAM_NETWORK_DEADLINE_MS", 900_000, 1_000, 3_600_000),
     networkDelayCapMs: intEnv(env, "UPSTREAM_NETWORK_DELAY_CAP_MS", 5_000, 100, 60_000),

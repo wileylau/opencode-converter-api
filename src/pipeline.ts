@@ -131,7 +131,10 @@ async function callZenWithRetry(
 
     if (geoRetryable && isGeoBlockMessage(drained)) {
       geoBlockPeeks += 1;
-      const delayMs = 600 + Math.floor(Math.random() * 400);
+      // backoff grows gently then holds steady — an endless block must not turn
+      // into a hot loop (each attempt is a paid upstream call), but must also
+      // recover within seconds when the pool rotates
+      const delayMs = Math.min(600 * Math.pow(1.25, Math.min(geoBlockPeeks - 1, 12)), 15_000) + Math.floor(Math.random() * 500);
       if (opts.signal?.aborted) {
         throw withGeoHint(zenErrorFromText(response.status, drained));
       }
