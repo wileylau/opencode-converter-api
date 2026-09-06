@@ -39,7 +39,7 @@ curl https://<your-worker>.workers.dev/v1/chat/completions \
   -d '{"model":"big-pickle","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
-Local dev: `npm run dev` (worker on `http://localhost:8787`).
+Local dev: `npm run dev` — starts on `localhost:8787` or the next free port if it's busy (see [Run locally](#run-locally-only-no-cloudflare-account-needed)).
 
 > **Recommended:** anonymous free-tier access through a deployed worker is unreliable (zen throttles datacenter IPs hard — see [free tier & rate limits](#free-tier--rate-limits)). Send **your own zen API key** — free to create — and you get a dedicated, reliable quota plus paid-model access:
 
@@ -59,6 +59,32 @@ Your zen key can travel in any of these — it goes client → worker → zen in
 | Query param | `…/v1/models?key=<zen-key>` |
 
 With no key at all you get anonymous free-tier access (`Bearer public`, exactly like the opencode CLI when logged out) — free models work, paid models return zen's auth error.
+
+## Run locally only (no Cloudflare account needed)
+
+You don't have to deploy anything — the worker runs entirely on your own machine:
+
+```bash
+npm install
+npm run dev
+```
+
+- The worker starts on **http://localhost:8787**.
+- **If that port is busy, the next free port is picked automatically** (8788, 8789, … up to 10 tries) and the actual URL is printed — handy when another `wrangler dev` (or anything else) already occupies 8787.
+- Start from a different port with `PORT=9000 npm run dev`.
+- Nothing is deployed anywhere, and local runs don't even need `wrangler login`.
+
+Try it:
+
+```bash
+curl http://localhost:8787/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"big-pickle","messages":[{"role":"user","content":"hi"}],"stream":true}'
+```
+
+Point any OpenAI-compatible client at `http://localhost:8787/v1` (replace the port with whatever `npm run dev` printed). Anthropic-style clients get `http://localhost:8787` as their base URL — their SDKs append `/v1/messages` themselves.
+
+Bonus: a local run has no Cloudflare subrequest cap, so you get the full reconnect budget (150 attempts) instead of the Free-plan's ~45.
 
 ## More examples
 
