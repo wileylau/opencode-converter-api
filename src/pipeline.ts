@@ -16,6 +16,7 @@ import {
   classifyFailure,
   emptyRetryDelay,
   isConnectivityFailure,
+  isGeoBlockMessage,
   networkRetryDelay,
   retryPolicyFromEnv,
   sleep,
@@ -67,6 +68,7 @@ async function callZenWithRetry(
 
   let version = "";
   let statusAttempt = 0;
+  let geoBlockPeeks = 0;
 
   for (;;) {
     statusAttempt += 1;
@@ -110,12 +112,38 @@ async function callZenWithRetry(
 
     version = result.version;
     const { response } = result;
-    const retryable = response.status === 429 || response.status === 502 || response.status === 503 || response.status === 529;
-    if (!retryable || statusAttempt >= policy.statusRetries) {
+    const standardRetryable = response.status === 429 || response.status === 502 || response.status === 503 || response.status === 529;
+
+    // Region blocks arrive as 401/403 (permanent-looking) but are usually
+    // transient: zen's provider pool rotates nodes, and the same model works
+    // seconds later. Peek at the body before deciding.
+    const geoRetryable =
+      (response.status === 401 || response.status === 403) &&
+      geoBlockPeeks < policy.geoBlockRetries;
+    let drained = "";
+    if (geoRetryable || standardRetryable) {
+      drained = await streamToTextSafe(response);
+      if (geoRetryable && !isGeoBlockMessage(drained)) {
+        // a genuine auth failure — hand it back untouched, no retries
+        return { response, version, attempts: statusAttempt, reconnects: shared.used, controller: result.controller };
+      }
+    }
+
+    if (geoRetryable && isGeoBlockMessage(drained)) {
+      geoBlockPeeks += 1;
+      const delayMs = 600 + Math.floor(Math.random() * 400);
+      if (opts.signal?.aborted) {
+        throw withGeoHint(zenErrorFromText(response.status, drained));
+      }
+      await sleep(delayMs);
+      statusAttempt -= 1; // geo-block retries use their own budget, not the status one
+      continue;
+    }
+
+    if (!standardRetryable || statusAttempt >= policy.statusRetries) {
       return { response, version, attempts: statusAttempt, reconnects: shared.used, controller: result.controller };
     }
     // capture the error body before retrying (a drained body can't be re-read)
-    const drained = await streamToTextSafe(response);
     const retryAfterHeader = response.headers.get("retry-after");
     const retryAfter = retryAfterHeader ? Number(retryAfterHeader) : NaN;
     const delayMs = statusRetryDelay(statusAttempt, Number.isFinite(retryAfter) ? retryAfter : undefined);
@@ -203,8 +231,23 @@ function toZenError(err: unknown): ZenError {
   return new ZenError(502, "network_error", `could not reach opencode zen: ${message}`);
 }
 
+/** Tag region-block errors once, so every failure path explains the retries. */
+function withGeoHint(err: ZenError): ZenError {
+  if (isGeoBlockMessage(err.message ?? "") && !err.message.includes("usually intermittent")) {
+    return new ZenError(
+      err.status,
+      err.upstreamType,
+      `${err.message} — this block is usually intermittent (zen's provider pool rotates nodes) and the request was retried automatically. Try again, or pick a different model.`,
+    );
+  }
+  return err;
+}
+
 /** Append actionable guidance to rate-limit style upstream errors. */
 function humanizeUpstreamError(err: ZenError, attempts: number, reconnects = 0): string {
+  if (isGeoBlockMessage(err.message ?? "")) {
+    return withGeoHint(err).message;
+  }
   const rateLimited =
     err.status === 429 || /rate.?limit|FreeUsageLimit/i.test(err.upstreamType) || /rate.?limit/i.test(err.message);
   if (!rateLimited) return err.message;

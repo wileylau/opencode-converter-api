@@ -16,6 +16,17 @@ const NETWORK_MESSAGE = /(network connection lost|connection (reset|refused|clos
 
 const SUBREQUEST_MESSAGE = /too many subrequests|subrequest limit/i;
 
+/**
+ * Region-block messages arrive with 401/403 (which look permanent) but are
+ * frequently transient: the same session works seconds later because zen's
+ * provider pool rotates nodes. Worth retrying a few times before giving up.
+ */
+const GEO_BLOCK_MESSAGE = /(not available in your country|not available in your region|geo[- ]?block|region[- ]?block|country|embargo|sanction|unavailable in your)/i;
+
+export function isGeoBlockMessage(message: string): boolean {
+  return GEO_BLOCK_MESSAGE.test(message);
+}
+
 /** Classify a thrown fetch/abort error so the caller knows which budget applies. */
 export function classifyFailure(err: unknown, clientAborted = false): FailureClass {
   const message = ((err as Error)?.message ?? String(err ?? "")).toLowerCase();
@@ -66,6 +77,8 @@ export interface RetryPolicy {
   networkRetries: number;
   /** attempts when the model is connected but returns nothing usable */
   emptyRetries: number;
+  /** attempts for intermittent region blocks behind 401/403 */
+  geoBlockRetries: number;
   /** wall-clock ceiling for the status-retry sequence */
   statusDeadlineMs: number;
   /** wall-clock ceiling for the reconnect sequence */
@@ -86,6 +99,7 @@ export function retryPolicyFromEnv(env: Record<string, unknown> | undefined): Re
     statusRetries: intEnv(env, "UPSTREAM_RETRIES", 3, 1, 20),
     networkRetries: intEnv(env, "UPSTREAM_NETWORK_RETRIES", 150, 1, 1000),
     emptyRetries: intEnv(env, "UPSTREAM_EMPTY_RETRIES", 30, 0, 200),
+    geoBlockRetries: intEnv(env, "UPSTREAM_GEOBLOCK_RETRIES", 4, 0, 20),
     statusDeadlineMs: intEnv(env, "UPSTREAM_TOTAL_DEADLINE_MS", 90_000, 1_000, 3_600_000),
     networkDeadlineMs: intEnv(env, "UPSTREAM_NETWORK_DEADLINE_MS", 900_000, 1_000, 3_600_000),
     networkDelayCapMs: intEnv(env, "UPSTREAM_NETWORK_DELAY_CAP_MS", 5_000, 100, 60_000),

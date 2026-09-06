@@ -853,3 +853,21 @@ describe("maximum reasoning effort", () => {
     ).toBe(true);
   });
 });
+
+describe("geo-block retry", () => {
+  it("recognizes region-block messages", async () => {
+    const { isGeoBlockMessage } = await import("../src/retry");
+    expect(isGeoBlockMessage("This model is not available in your country.")).toBe(true);
+    expect(isGeoBlockMessage("Model is not available in your region")).toBe(true);
+    expect(isGeoBlockMessage("geo-blocked by provider")).toBe(true);
+    expect(isGeoBlockMessage("Invalid API key.")).toBe(false);
+    expect(isGeoBlockMessage("Rate limit exceeded.")).toBe(false);
+  });
+
+  it("defaults to 4 geo-block retries", async () => {
+    const { retryPolicyFromEnv } = await import("../src/retry");
+    expect(retryPolicyFromEnv({}).geoBlockRetries).toBe(4);
+    expect(retryPolicyFromEnv({ UPSTREAM_GEOBLOCK_RETRIES: 9 }).geoBlockRetries).toBe(9);
+    expect(retryPolicyFromEnv({ UPSTREAM_GEOBLOCK_RETRIES: 0 }).geoBlockRetries).toBe(0);
+  });
+});
