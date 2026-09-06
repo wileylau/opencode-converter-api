@@ -1,5 +1,7 @@
 # opencode-converter-api
 
+**English** | [فارسی](README.fa.md)
+
 A Cloudflare Worker that puts [opencode zen](https://opencode.ai/docs/zen/) behind standard, self-hostable API surfaces:
 
 - **`POST /v1/chat/completions`** — OpenAI Chat Completions compatible
@@ -19,55 +21,9 @@ any OpenAI / Anthropic / Responses client
       opencode.ai/zen/v1
 ```
 
-## How it works
+## Quick start
 
-Zen natively exposes four different API dialects, locked per model family:
-
-| Model family | Zen endpoint | Zen dialect |
-|---|---|---|
-| `gpt-*`, `grok-*`, `muse-*` | `/zen/v1/responses` | OpenAI Responses |
-| `claude-*`, `qwen*` | `/zen/v1/messages` | Anthropic Messages |
-| `glm-*`, `kimi-*`, `minimax-*`, `deepseek-*`, `big-pickle`, `*free` (most) | `/zen/v1/chat/completions` | OpenAI Chat |
-| `gemini-*` | `/zen/v1/models/{model}:generateContent` | Gemini |
-
-Hitting the wrong endpoint for a model fails, so this worker routes every request to the right native dialect after a single canonical conversion:
-
-```
-inbound format ──parse──▶ canonical request ──build──▶ zen native dialect
-                                                       (auto-routed per model)
-inbound format ◀─emit─── canonical events/resp ◀─parse── zen SSE / JSON
-```
-
-### CLI identity (the important bit)
-
-Zen's free tier only serves clients that look like the opencode CLI — verified experimentally: without the CLI `User-Agent`, free models return `429 FreeUsageLimitError`. This worker sends exactly what the real CLI sends (source: `packages/opencode/src/session/llm/request.ts` in `anomalyco/opencode`):
-
-```
-User-Agent: opencode/<version>
-Authorization: Bearer <your-key | "public">
-x-opencode-client: cli
-x-opencode-session / x-opencode-request / x-opencode-project: <ids>
-```
-
-The version is **fetched live** from the npm registry (`opencode-ai/latest`) with a GitHub releases fallback, cached for one hour at the edge — so it tracks the latest CLI release with zero maintenance. Pin it via the `FALLBACK_VERSION` var if you ever need to.
-
-### Authentication model
-
-Your zen key **never touches this worker's config** — it travels client → worker → zen inside the request itself:
-
-```bash
-# any of these carry your zen key
-Authorization: Bearer <zen-key>
-x-api-key: <zen-key>
-x-goog-api-key: <zen-key>
-?key=<zen-key>            # query param, Gemini-SDK style
-```
-
-- **No key at all** → anonymous free-tier access (`Bearer public`, exactly like the CLI when logged out). Free models work; paid models return zen's auth error.
-- **Optional `GATEWAY_KEY` secret** → require callers to also send `x-oc-gateway-key: <gateway-key>` (or use it as the bearer) to protect your deployment from strangers; the zen key then comes from `x-zen-key`/`x-api-key`/`?key=`.
-- **Optional `DEFAULT_ZEN_KEY` secret** → a deployment-wide fallback zen key used when a caller sends none.
-
-## Deploy
+Deploy your own copy in three commands:
 
 ```bash
 npm install
@@ -75,23 +31,38 @@ npx wrangler login
 npm run deploy          # uses wrangler.toml
 ```
 
-Optional secrets:
+Then send your first request — a free model, no key needed:
 
 ```bash
-npx wrangler secret put GATEWAY_KEY      # gate your deployment
-npx wrangler secret put DEFAULT_ZEN_KEY  # deployment-wide zen key
+curl https://<your-worker>.workers.dev/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"big-pickle","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
 Local dev: `npm run dev` (worker on `http://localhost:8787`).
 
-## Usage
+> **Recommended:** anonymous free-tier access through a deployed worker is unreliable (zen throttles datacenter IPs hard — see [free tier & rate limits](#free-tier--rate-limits)). Send **your own zen API key** — free to create — and you get a dedicated, reliable quota plus paid-model access:
 
 ```bash
-# OpenAI style (free model, anonymous)
-curl http://localhost:8787/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"big-pickle","messages":[{"role":"user","content":"hi"}],"stream":true}'
+curl https://<your-worker>.workers.dev/v1/chat/completions \
+  -H 'Authorization: Bearer <zen-key>' -H 'Content-Type: application/json' \
+  -d '{"model":"big-pickle","messages":[{"role":"user","content":"hi"}]}'
+```
 
+Your zen key can travel in any of these — it goes client → worker → zen inside the request itself and **never touches this worker's config**:
+
+| Send your key as | Example |
+|---|---|
+| Bearer token | `Authorization: Bearer <zen-key>` |
+| Anthropic-style header | `x-api-key: <zen-key>` |
+| Gemini-style header | `x-goog-api-key: <zen-key>` |
+| Query param | `…/v1/models?key=<zen-key>` |
+
+With no key at all you get anonymous free-tier access (`Bearer public`, exactly like the opencode CLI when logged out) — free models work, paid models return zen's auth error.
+
+## More examples
+
+```bash
 # Anthropic style (your key, paid model)
 curl https://<your-worker>.workers.dev/v1/messages \
   -H 'x-api-key: <zen-key>' -H 'Content-Type: application/json' \
@@ -111,7 +82,118 @@ curl http://localhost:8787/v1/chat/completions -H 'Content-Type: application/jso
 
 Tools, `stream`, `stop`, `temperature`, `top_p`, `max_tokens` / `max_output_tokens`, `reasoning_effort` / `thinking.budget_tokens`, and JSON-schema response formats are translated across all three formats.
 
-### Multimodal support matrix
+**Good to know**
+
+- Send `x-session-id: <some-stable-id>` to group your requests under one zen session (mirrors how the CLI behaves).
+- Every request runs at the **highest reasoning level the model supports** by default; set `FORCE_MAX_REASONING=0` to respect what the client asked for instead.
+- No request logging, no key storage, no state: everything lives in the request/response cycle.
+
+---
+
+## ⚙️ Advanced settings
+
+### Secrets (optional)
+
+```bash
+npx wrangler secret put GATEWAY_KEY      # gate your deployment
+npx wrangler secret put DEFAULT_ZEN_KEY  # deployment-wide zen key
+```
+
+- **`GATEWAY_KEY`** — require callers to also send `x-oc-gateway-key: <gateway-key>` (or use it as the bearer) to protect your deployment from strangers; the zen key then comes from `x-zen-key`/`x-api-key`/`?key=`.
+- **`DEFAULT_ZEN_KEY`** — a deployment-wide fallback zen key used when a caller sends none.
+
+### Environment variables
+
+All optional; set them in `wrangler.toml` under `[vars]` or as secrets. Defaults are sane — you never *need* to touch these.
+
+| Variable | Default | What it controls |
+|---|---|---|
+| `UPSTREAM_RETRIES` | `3` (max 20) | retry attempts when zen is busy (429 / 502 / 503 / 529) |
+| `UPSTREAM_TOTAL_DEADLINE_MS` | `90000` | wall-clock ceiling for the busy-retry sequence (90 s) |
+| `UPSTREAM_NETWORK_RETRIES` | `150` (max 1000) | reconnect attempts on connectivity failures (dropped connection, DNS/TLS, timeout) |
+| `UPSTREAM_NETWORK_DEADLINE_MS` | `900000` | wall-clock ceiling for reconnects (15 min) |
+| `UPSTREAM_NETWORK_DELAY_CAP_MS` | `5000` | cap on the delay between reconnect attempts (5 s) |
+| `UPSTREAM_EMPTY_RETRIES` | `30` (max 200) | restarts when the model returns an empty answer |
+| `UPSTREAM_HEADER_TIMEOUT_MS` | `120000` | how long to wait for zen's response headers before reconnecting (120 s) |
+| `UPSTREAM_BODY_TIMEOUT_MS` | `240000` | non-streaming body must finish within this (240 s) |
+| `UPSTREAM_STALL_TIMEOUT_MS` | `300000` | stream stall limit — no SSE data for this long (300 s) |
+| `STREAM_DEADLINE_MS` | `570000` | whole-stream deadline (570 s) |
+| `FORCE_MAX_REASONING` | `1` | set `0` to respect client-requested reasoning levels |
+| `FALLBACK_VERSION` | — | pin the opencode CLI version instead of the live npm lookup |
+
+### Retry & timeout behavior
+
+Every upstream call is bounded — a request can never hang forever. There are two **independent** budgets: a reconnect never consumes a status retry, and vice versa.
+
+| | Connectivity failures (dropped connection, DNS/TLS failure, timeout) | Upstream busy (429 / 502 / 503 / 529) |
+|---|---|---|
+| Attempts | **150** (`UPSTREAM_NETWORK_RETRIES`) | 3 (`UPSTREAM_RETRIES`) |
+| Deadline | 15 min (`UPSTREAM_NETWORK_DEADLINE_MS`) | 90 s (`UPSTREAM_TOTAL_DEADLINE_MS`) |
+| Backoff | 250 ms → 500 ms → 1 s → 2 s → 5 s steady, jittered (`UPSTREAM_NETWORK_DELAY_CAP_MS`) | exponential to 9 s, honors `Retry-After` |
+
+On timeout the client gets a clean error in its own API format (streaming clients get an SSE error event, and OpenAI-format streams still terminate with `finish_reason` + `[DONE]`). Retries stop immediately when your client disconnects, and disconnecting aborts the upstream fetch.
+
+> **Platform caveat:** Cloudflare caps outbound subrequests per request (50 on the Free plan, 1000 on paid), so a deployed Free-plan worker can only make ~45 reconnect attempts before the platform refuses. When that happens the error says so explicitly instead of failing cryptically. Local `wrangler dev` and paid plans use the full 150.
+
+---
+
+## 🔍 Under the hood
+
+<details>
+<summary><b>Endpoint routing (how one URL serves every model)</b></summary>
+
+Zen natively exposes four different API dialects, locked per model family:
+
+| Model family | Zen endpoint | Zen dialect |
+|---|---|---|
+| `gpt-*`, `grok-*`, `muse-*` | `/zen/v1/responses` | OpenAI Responses |
+| `claude-*`, `qwen*` | `/zen/v1/messages` | Anthropic Messages |
+| `glm-*`, `kimi-*`, `minimax-*`, `deepseek-*`, `big-pickle`, `*free` (most) | `/zen/v1/chat/completions` | OpenAI Chat |
+| `gemini-*` | `/zen/v1/models/{model}:generateContent` | Gemini |
+
+Hitting the wrong endpoint for a model fails, so this worker routes every request to the right native dialect after a single canonical conversion:
+
+```
+inbound format ──parse──▶ canonical request ──build──▶ zen native dialect
+                                                       (auto-routed per model)
+inbound format ◀─emit─── canonical events/resp ◀─parse── zen SSE / JSON
+```
+
+</details>
+
+<details>
+<summary><b>CLI identity (why free models work at all)</b></summary>
+
+Zen's free tier only serves clients that look like the opencode CLI — verified experimentally: without the CLI `User-Agent`, free models return `429 FreeUsageLimitError`. This worker sends exactly what the real CLI sends (source: `packages/opencode/src/session/llm/request.ts` in `anomalyco/opencode`):
+
+```
+User-Agent: opencode/<version>
+Authorization: Bearer <your-key | "public">
+x-opencode-client: cli
+x-opencode-session / x-opencode-request / x-opencode-project: <ids>
+```
+
+The version is **fetched live** from the npm registry (`opencode-ai/latest`) with a GitHub releases fallback, cached for one hour at the edge — so it tracks the latest CLI release with zero maintenance. Pin it via the `FALLBACK_VERSION` var if you ever need to.
+
+</details>
+
+<details>
+<summary><b>Free tier & rate limits</b></summary>
+
+The anonymous free tier (no key) shares one quota pool, and zen throttles aggressively — **especially from datacenter IPs like Cloudflare Workers' egress ranges**. In practice, anonymous access through a deployed worker is unreliable (429 `FreeUsageLimitError` most of the time); from a residential IP it works until the local pool drains. **Treat BYOK as the primary usage mode.**
+
+The worker mitigates residual rate limits for you:
+
+- **Automatic retries** with exponential backoff on upstream 429/502/503 — retried only before any byte reaches your client, so streaming stays correct.
+- **Actionable errors**: when the pool is drained the error message says so and suggests sending your own key.
+- **Stable sessions**: `x-session-id` groups your requests under one zen session instead of a fresh session id per request.
+
+Free models work with a key too — BYOK just removes the shared-pool lottery.
+
+</details>
+
+<details>
+<summary><b>Multimodal support matrix</b></summary>
 
 | Inbound part | Translated as |
 |---|---|
@@ -122,17 +204,10 @@ Tools, `stream`, `stop`, `temperature`, `top_p`, `max_tokens` / `max_output_toke
 
 If a target model can't accept a modality (zen is authoritative here), the request is passed through as-is and zen's own error is surfaced in your request's format.
 
-## Rate limits & free-tier behavior
+</details>
 
-The anonymous free tier (no key) shares one quota pool, and zen throttles aggressively — **especially from datacenter IPs like Cloudflare Workers' egress ranges**. In practice, anonymous access through a deployed worker is unreliable (429 `FreeUsageLimitError` most of the time); from a residential IP it works until the local pool drains. **Treat BYOK as the primary usage mode**: send any zen API key (free to create) and you get a dedicated, reliable quota plus paid-model access. The worker mitigates residual rate limits for you:
-
-- **Automatic retries** with exponential backoff on upstream 429/502/503 (default 3 attempts, tune with the `UPSTREAM_RETRIES` var, max 6) — retried only before any byte reaches your client, so streaming stays correct.
-- **Actionable errors**: when the pool is drained the error message says so and suggests sending your own key.
-- **Stable sessions**: send `x-session-id: <some-stable-id>` to group your requests under one zen session (mirrors how the CLI behaves) instead of a fresh session id per request.
-
-For real work, send **your own zen API key** (any of the auth headers above) — you then have a dedicated quota and access to paid models. Free models work with a key too.
-
-## Client compatibility fixes
+<details>
+<summary><b>Client compatibility fixes</b></summary>
 
 Agent clients send payloads that zen's upstreams reject outright. The converter normalizes them transparently:
 
@@ -141,7 +216,10 @@ Agent clients send payloads that zen's upstreams reject outright. The converter 
 - **Per-family constraints** — when an upstream rejects a mapped param (e.g. Meta's muse models accept only `tool_choice: "auto"`), the request is rebuilt once without it and retried automatically instead of failing.
 - **Empty-answer recovery** — muse-class models sometimes stream the entire answer as *reasoning* and end with an empty visible message; clients that hide reasoning then show nothing. The converter also captures text that upstreams deliver only in `done`/`completed` events (skipping normal deltas), and if a response would arrive with reasoning but no visible text and no tool calls, the reasoning content is promoted to a normal text reply.
 
-## Maximum reasoning, always
+</details>
+
+<details>
+<summary><b>Maximum reasoning, always</b></summary>
 
 Every request runs the model at the **highest reasoning level it supports**, descending only if the upstream rejects it:
 
@@ -153,7 +231,10 @@ The starting level comes from a built-in table of what each zen model advertises
 
 Set `FORCE_MAX_REASONING=0` to respect whatever the client asked for instead.
 
-## When the model thinks but says nothing
+</details>
+
+<details>
+<summary><b>Empty answers, self-healing streams & robustness guarantees</b></summary>
 
 Reasoning-heavy models routinely burn their whole token budget on internal thinking and return an empty answer, or go quiet for minutes before the first byte. Those are treated as retryable, not as failures:
 
@@ -166,44 +247,11 @@ Reasoning-heavy models routinely burn their whole token budget on internal think
 
 Each restart doubles the token budget (from 2 048 up to 200 000), because the usual cause is reasoning consuming everything before the visible answer starts. Restarts only happen while your client has received nothing, so output is never duplicated; successful requests report the count in `x-opencode-empty-retries`.
 
-## Surviving a dropped internet connection
-
-Connectivity failures get their own, much larger budget than "upstream is busy" failures, because the right response to a dead network is patient reconnection:
-
-| | Connectivity failures (dropped connection, DNS/TLS failure, timeout) | Upstream busy (429 / 502 / 503 / 529) |
-|---|---|---|
-| Attempts | **150** (`UPSTREAM_NETWORK_RETRIES`, max 1000) | 3 (`UPSTREAM_RETRIES`, max 20) |
-| Deadline | 15 min (`UPSTREAM_NETWORK_DEADLINE_MS`) | 90 s (`UPSTREAM_TOTAL_DEADLINE_MS`) |
-| Backoff | 250 ms → 500 ms → 1 s → 2 s → 5 s steady, jittered (`UPSTREAM_NETWORK_DELAY_CAP_MS`) | exponential to 9 s, honors `Retry-After` |
-
-The two budgets are independent: a reconnect never consumes a status retry, and vice versa.
-
 **Streams heal themselves too.** If the connection dies *before your client has received any bytes* — including mid-SSE — the request is transparently reopened and restarted from scratch (emitter and reasoning guard reset, so nothing is replayed twice). Once bytes have reached your client a restart would duplicate output, so instead you get a clear error event explaining that the partial reply is all that arrived.
 
-Non-streaming requests reconnect the same way while reading the response body. Successful requests that needed reconnects report them in `x-opencode-reconnects` (streaming responses can't, since SSE headers are sent first).
+Non-streaming requests reconnect the same way while reading the response body. Successful requests that needed reconnects report them in `x-opencode-reconnects` (streaming responses can't, since SSE headers are sent first). The model list and the CLI-version lookup fall back to cached values during an outage, so a dead network never turns into a hang.
 
-Retries stop immediately when your client disconnects, and the model list plus the CLI-version lookup fall back to cached values during an outage, so a dead network never turns into a hang.
-
-> **Platform caveat:** Cloudflare caps outbound subrequests per request (50 on the Free plan, 1000 on paid), so a deployed Free-plan worker can only make ~45 reconnect attempts before the platform refuses. When that happens the error says so explicitly instead of failing cryptically. Local `wrangler dev` and paid plans use the full 150.
-
-## Timeouts (no more infinite hangs)
-
-Every upstream call is bounded; a request can never hang forever:
-
-| Layer | Default | Env var |
-|---|---|---|
-| zen must send response headers | 20 s | `UPSTREAM_HEADER_TIMEOUT_MS` |
-| retry attempts on 429/5xx/timeout | 3 (max 6) | `UPSTREAM_RETRIES` |
-| whole retry sequence | 90 s | `UPSTREAM_TOTAL_DEADLINE_MS` |
-| non-streaming body must finish | 240 s | `UPSTREAM_BODY_TIMEOUT_MS` |
-| stream stall — no SSE data | 60 s | `UPSTREAM_STALL_TIMEOUT_MS` |
-| whole stream | 570 s | `STREAM_DEADLINE_MS` |
-
-On timeout the client gets a clean error in its own API format (streaming clients get an SSE error event, and OpenAI-format streams still terminate with `finish_reason` + `[DONE]`); hung upstream connections are retried automatically, retries stop as soon as your client disconnects, and disconnecting aborts the upstream fetch.
-
-## Robustness guarantees
-
-The converter is defensive about upstream behavior that would otherwise surface as a silent failure:
+Other defensive behavior:
 
 - **Streams that end without a terminator** get a synthesized stop (routed through the empty-answer guard, so a reasoning-only answer still yields text).
 - **Mid-stream upstream errors** are forwarded as a proper error event before the stream closes, instead of being masked by a "completed" event.
@@ -211,14 +259,19 @@ The converter is defensive about upstream behavior that would otherwise surface 
 - **Tool calls truncated mid-arguments** are still surfaced with their partial arguments instead of vanishing.
 - **A stale or fallback model list never rejects a model**: unknown ids are forwarded to zen, which is authoritative.
 
-## Notes & limits
+</details>
 
-- Responses streaming uses Cloudflare Workers' CPU limits (`cpu_ms = 30000` in `wrangler.toml`); long generations stream fine but adjust to taste.
+<details>
+<summary><b>Notes & limits</b></summary>
+
+- Responses streaming wants generous CPU limits (`[limits] cpu_ms` in `wrangler.toml` is **paid-plan-only** — Free deploys fail with error 100328 if set). Waiting on the upstream costs no CPU; per-event conversion does (~12 µs/event), so very long streams can approach the Free plan's 10 ms budget. On a paid plan add the `[limits]` block back.
 - The live model list is cached 5 minutes; a static fallback list keeps `/v1/models` and routing alive even if zen's list endpoint hiccups.
 - `cost` returned by zen is passed through (`cost` field on chat completions, `usage.cost` on responses).
-- No request logging, no key storage, no state: everything lives in the request/response cycle (the only caches are the public model list and the public CLI version).
 
-## Repo layout
+</details>
+
+<details>
+<summary><b>Repo layout & development</b></summary>
 
 ```
 src/index.ts          router, CORS, auth extraction, /v1/models
@@ -234,10 +287,10 @@ src/version.ts        auto-updating CLI version (npm → github → fallback)
 test/convert.test.ts  unit tests (vitest)
 ```
 
-## Development
-
 ```bash
 npm run typecheck   # tsc --noEmit
 npm test            # vitest
 npm run dev         # wrangler dev
 ```
+
+</details>
