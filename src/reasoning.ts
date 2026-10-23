@@ -87,8 +87,27 @@ export interface EffortPlan {
   known: boolean;
 }
 
+/**
+ * Highest effort each model has actually accepted so far. The descend chain
+ * costs one upstream 400 per step, so without this every turn for a model that
+ * is not in MAX_EFFORT re-probes the whole chain — a burst of extra requests
+ * that counts against the same rate-limit pool as the real traffic.
+ */
+const learnedEffort = new Map<string, Effort | undefined>();
+
+/** Record the level a model accepted, so later requests skip the probe. */
+export function rememberEffort(model: string, effort: Effort | undefined): void {
+  learnedEffort.set(model, effort);
+}
+
+/** Forget learned levels (tests, or after a policy/table change). */
+export function resetLearnedEffort(): void {
+  learnedEffort.clear();
+}
+
 /** Highest effort worth trying first for a model. */
 export function planMaxEffort(model: string): EffortPlan {
+  if (learnedEffort.has(model)) return { effort: learnedEffort.get(model), known: true };
   const entry = MAX_EFFORT[model];
   if (entry === null) return { effort: undefined, known: true };
   if (entry && entry !== "unlabelled") return { effort: entry, known: true };

@@ -53,6 +53,11 @@ inbound JSON -> src/parse/requests.ts -> src/canonical.ts
 - Reasoning is forced to each model's max by default (`FORCE_MAX_REASONING=0` disables).
   Known models live in `MAX_EFFORT` in `src/reasoning.ts`; unknown models start at
   `max` and step down on upstream rejection.
+- Identity (`x-opencode-project` / `x-opencode-session`) comes from `src/identity.ts`.
+  `scripts/dev.mjs` detects an installed opencode, creates one persisted proxy project
+  (`.wrangler/opencode-converter-project-id`), and injects `OPENCODE_INSTALLED` /
+  `OPENCODE_PROJECT_ID`. Without them, clients that send no session header share one
+  deterministic weekly session. Never mint a new id per request or retry.
 
 ## Config
 

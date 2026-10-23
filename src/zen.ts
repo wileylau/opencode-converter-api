@@ -18,7 +18,7 @@
  */
 
 import { getOpencodeVersion, fallbackVersion } from "./version";
-import { stableProjectId } from "./util";
+import { defaultSessionId, proxyProjectId } from "./identity";
 
 export const ZEN_BASE = "https://opencode.ai/zen/v1";
 
@@ -112,8 +112,6 @@ export interface ZenCallContext {
   ctx?: { waitUntil(p: Promise<unknown>): void };
 }
 
-let sessionCounter = 0;
-
 /**
  * Headers that make the request look exactly like the opencode CLI talking to zen.
  * Verified against the CLI source (packages/opencode/src/session/llm/request.ts):
@@ -132,12 +130,12 @@ export async function zenHeaders(
   } catch {
     version = fallbackVersion(env);
   }
-  // A caller-supplied stable session id groups requests under one zen session,
-  // which beats a fresh random id per request for rate-limit accounting.
+  // A caller-supplied session id wins. Otherwise use the proxy identity: one
+  // stable session under the proxy's project when opencode is installed, or a
+  // weekly fallback when it is not. Never mint a new id per request or retry —
+  // that makes one machine look like an endless stream of new CLI sessions.
   const session =
-    sessionId && /^[-\w.]{8,128}$/.test(sessionId)
-      ? sessionId
-      : `ses_conv_${Date.now().toString(36)}_${(sessionCounter++).toString(36)}_${crypto.getRandomValues(new Uint8Array(4)).join("")}`;
+    sessionId && /^[-\w.]{8,128}$/.test(sessionId) ? sessionId : defaultSessionId(env);
   const request = `req_${crypto.randomUUID()}`;
   const headers: Record<string, string> = {
     "content-type": "application/json",
@@ -145,7 +143,7 @@ export async function zenHeaders(
     "x-opencode-client": "cli",
     "x-opencode-session": session,
     "x-opencode-request": request,
-    "x-opencode-project": stableProjectId(),
+    "x-opencode-project": proxyProjectId(env),
     ...extraHeaders,
   };
   if (auth.apiKey) {
@@ -253,7 +251,10 @@ const STATIC_MODEL_FALLBACK: ZenModelInfo[] = [
 ];
 
 let modelCache: { at: number; models: ZenModelInfo[]; base: string } | null = null;
+/** Last failed lookup, so a throttled upstream is not hit once per completion. */
+let modelFailure: { at: number; base: string } | null = null;
 const MODEL_TTL = 5 * 60 * 1000;
+const MODEL_FAILURE_TTL = 60 * 1000;
 
 export interface ZenModelList {
   models: ZenModelInfo[];
@@ -267,6 +268,12 @@ export async function fetchZenModels(env?: Record<string, unknown>): Promise<Zen
   if (modelCache && modelCache.base === base && now - modelCache.at < MODEL_TTL) {
     return { models: modelCache.models, stale: false };
   }
+  if (modelFailure && modelFailure.base === base && now - modelFailure.at < MODEL_FAILURE_TTL) {
+    // Negative cache: while zen is throttling, do not add a /models lookup to
+    // every completion — fall back to the stale list or the built-in snapshot.
+    if (modelCache && modelCache.base === base) return { models: modelCache.models, stale: true };
+    return { models: STATIC_MODEL_FALLBACK, stale: true };
+  }
   try {
     const res = await fetch(`${base}/models`, {
       headers: { accept: "application/json", "user-agent": "opencode-converter-api" },
@@ -279,10 +286,12 @@ export async function fetchZenModels(env?: Record<string, unknown>): Promise<Zen
       .map((m) => ({ id: m.id, created: m.created ?? 0 }));
     if (models.length) {
       modelCache = { at: now, models, base };
+      modelFailure = null;
       return { models, stale: false };
     }
     throw new Error("empty model list");
   } catch {
+    modelFailure = { at: now, base };
     // stale-but-known beats empty, but callers must not reject unknown ids from it
     if (modelCache && modelCache.base === base) return { models: modelCache.models, stale: true };
     return { models: STATIC_MODEL_FALLBACK, stale: true };

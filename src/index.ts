@@ -26,6 +26,10 @@ interface WorkerEnv {
   DEFAULT_ZEN_KEY?: string;
   FALLBACK_VERSION?: string;
   UPSTREAM_BASE?: string;
+  /** set by scripts/dev.mjs when an opencode install is detected */
+  OPENCODE_INSTALLED?: string;
+  /** persisted proxy project id (created by scripts/dev.mjs) */
+  OPENCODE_PROJECT_ID?: string;
 }
 
 export default {
@@ -99,7 +103,7 @@ export default {
         format,
         body,
         auth: { apiKey: auth.zenKey },
-        sessionId: request.headers.get("x-session-id") ?? undefined,
+        sessionId: clientSessionId(request),
         signal: request.signal,
       });
     }
@@ -133,7 +137,7 @@ export default {
         body,
         auth: { apiKey: auth.zenKey },
         modelOverride: model,
-        sessionId: request.headers.get("x-session-id") ?? undefined,
+        sessionId: clientSessionId(request),
         signal: request.signal,
       });
     }
@@ -144,6 +148,15 @@ export default {
 
 function envWithBase(env: WorkerEnv): Record<string, unknown> {
   return env as unknown as Record<string, unknown>;
+}
+
+/**
+ * The client's session id, if it sent one. `x-opencode-session` is accepted as
+ * an alias because clients already configured for the opencode CLI send it, and
+ * reusing the id keeps their turns in the same zen rate-limit bucket.
+ */
+function clientSessionId(request: Request): string | undefined {
+  return request.headers.get("x-session-id") ?? request.headers.get("x-opencode-session") ?? undefined;
 }
 
 async function safeVersion(env: WorkerEnv, ctx: ExecutionContext): Promise<string> {

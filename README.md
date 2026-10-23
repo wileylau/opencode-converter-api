@@ -73,6 +73,8 @@ npm run dev
 - **If that port is busy, the next free port is picked automatically** (8788, 8789, … up to 10 tries) and the actual URL is printed — handy when another `wrangler dev` (or anything else) already occupies 8787.
 - Start from a different port with `PORT=9000 npm run dev`.
 - Nothing is deployed anywhere, and local runs don't even need `wrangler login`.
+- To use your zen key locally, create `.dev.vars` (git-ignored) with `DEFAULT_ZEN_KEY=<zen-key>`. This matters if the opencode CLI is also running on the machine: both otherwise draw from the same anonymous IP quota.
+- If `opencode` is on `PATH`, the dev launcher creates a project for the proxy once (persisted in `.wrangler/opencode-converter-project-id`) and passes it to the worker, so every request carries that project plus one stable session under it. Without opencode, requests that send no session header share a deterministic weekly fallback (`ses_conv_w2026_43`-style) that rotates every Monday. Force either mode with `OPENCODE_INSTALLED=0|1`.
 
 Try it:
 
@@ -110,7 +112,7 @@ Tools, `stream`, `stop`, `temperature`, `top_p`, `max_tokens` / `max_output_toke
 
 **Good to know**
 
-- Send `x-session-id: <some-stable-id>` to group your requests under one zen session (mirrors how the CLI behaves).
+- Send `x-session-id: <some-stable-id>` (or `x-opencode-session`) to group your requests under one zen session. If you send neither, the worker falls back to the proxy identity: a stable session under the proxy's own project when opencode is installed, otherwise a deterministic weekly session id.
 - Every request runs at the **highest reasoning level the model supports** by default; set `FORCE_MAX_REASONING=0` to respect what the client asked for instead.
 - No request logging, no key storage, no state: everything lives in the request/response cycle.
 
@@ -139,13 +141,15 @@ All optional; set them in `wrangler.toml` under `[vars]` or as secrets. Defaults
 | `UPSTREAM_NETWORK_RETRIES` | `150` (max 1000) | reconnect attempts on connectivity failures (dropped connection, DNS/TLS, timeout) |
 | `UPSTREAM_NETWORK_DEADLINE_MS` | `900000` | wall-clock ceiling for reconnects (15 min) |
 | `UPSTREAM_NETWORK_DELAY_CAP_MS` | `5000` | cap on the delay between reconnect attempts (5 s) |
-| `UPSTREAM_EMPTY_RETRIES` | `30` (max 200) | restarts when the model returns an empty answer |
+| `UPSTREAM_EMPTY_RETRIES` | `8` (max 200) | restarts when the model returns an empty answer (8 doubles the token budget to the 200 000 cap) |
 | `UPSTREAM_HEADER_TIMEOUT_MS` | `120000` | how long to wait for zen's response headers before reconnecting (120 s) |
 | `UPSTREAM_BODY_TIMEOUT_MS` | `240000` | non-streaming body must finish within this (240 s) |
 | `UPSTREAM_STALL_TIMEOUT_MS` | `300000` | stream stall limit — no SSE data for this long (300 s) |
 | `STREAM_DEADLINE_MS` | `570000` | whole-stream deadline (570 s) |
 | `FORCE_MAX_REASONING` | `1` | set `0` to respect client-requested reasoning levels |
 | `FALLBACK_VERSION` | — | pin the opencode CLI version instead of the live npm lookup |
+| `OPENCODE_INSTALLED` | auto-detected by `npm run dev` | set `1` to use the proxy project/session without local detection (set `0` to force the weekly fallback) |
+| `OPENCODE_PROJECT_ID` | created by `npm run dev` | persisted proxy project id; set it manually to share one identity across runs/containers |
 
 ### Retry & timeout behavior
 
@@ -208,11 +212,15 @@ The version is **fetched live** from the npm registry (`opencode-ai/latest`) wit
 
 The anonymous free tier (no key) shares one quota pool, and zen throttles aggressively — **especially from datacenter IPs like Cloudflare Workers' egress ranges**. In practice, anonymous access through a deployed worker is unreliable (429 `FreeUsageLimitError` most of the time); from a residential IP it works until the local pool drains. **Treat BYOK as the primary usage mode.**
 
+> **Running the converter on the same machine as the opencode CLI?** Both then send anonymous requests (`Bearer public`) from the same public IP, so they drain the *same* free-tier pool. Two clients plus the worker's retries exhaust a small pool almost immediately. Send a key (a `.dev.vars` file with `DEFAULT_ZEN_KEY=<zen-key>` works for `npm run dev`), or keep only one anonymous client running. `FORCE_MAX_REASONING=0` also cuts token spend on small/background requests.
+
 The worker mitigates residual rate limits for you:
 
 - **Automatic retries** with exponential backoff on upstream 429/502/503 — retried only before any byte reaches your client, so streaming stays correct.
 - **Actionable errors**: when the pool is drained the error message says so and suggests sending your own key.
-- **Stable sessions**: `x-session-id` groups your requests under one zen session instead of a fresh session id per request.
+- **Stable sessions**: `x-session-id`/`x-opencode-session` groups your requests under one zen session. Without either header the worker uses the proxy identity — a stable session under the proxy's project when opencode is installed, or a weekly fallback otherwise — instead of minting a new session for every request and retry.
+- **One probe per model**: a model's accepted reasoning level is remembered, so later turns skip the `max → none` 400 chain.
+- **Bounded retries**: empty-answer restarts share one per-request budget across repair passes, and an empty answer that ended in an upstream error is not retried at all.
 
 Free models work with a key too — BYOK just removes the shared-pool lottery.
 
@@ -269,7 +277,7 @@ Reasoning-heavy models routinely burn their whole token budget on internal think
 | No response headers yet | wait up to **120 s** (`UPSTREAM_HEADER_TIMEOUT_MS`), then reconnect |
 | Connected, no data yet | wait up to **300 s** (`UPSTREAM_STALL_TIMEOUT_MS`), then restart the attempt |
 | Answer arrives with no text, tool calls, or reasoning | restart the attempt |
-| Restart budget | **30 attempts** (`UPSTREAM_EMPTY_RETRIES`) |
+| Restart budget | **8 attempts** (`UPSTREAM_EMPTY_RETRIES`) — enough to double the token budget to the cap |
 
 Each restart doubles the token budget (from 2 048 up to 200 000), because the usual cause is reasoning consuming everything before the visible answer starts. Restarts only happen while your client has received nothing, so output is never duplicated; successful requests report the count in `x-opencode-empty-retries`.
 

@@ -6,7 +6,7 @@ export const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers":
-    "Authorization, Content-Type, x-api-key, x-goog-api-key, x-zen-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access, openai-beta, openai-organization, x-opencode-client, x-session-id, x-oc-version, x-oc-gateway-key, x-stainless-os, x-stainless-lang, x-stainless-arch, x-stainless-runtime, x-stainless-runtime-version, x-stainless-package-version, x-stainless-retry-count, x-stainless-timeout, x-stainless-helper-method, user-agent",
+    "Authorization, Content-Type, x-api-key, x-goog-api-key, x-zen-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access, openai-beta, openai-organization, x-opencode-client, x-opencode-session, x-session-id, x-oc-version, x-oc-gateway-key, x-stainless-os, x-stainless-lang, x-stainless-arch, x-stainless-runtime, x-stainless-runtime-version, x-stainless-package-version, x-stainless-retry-count, x-stainless-timeout, x-stainless-helper-method, user-agent",
   "Access-Control-Expose-Headers":
     "x-opencode-converter-version, x-opencode-upstream, x-request-id, retry-after",
   "Access-Control-Max-Age": "86400",

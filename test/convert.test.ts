@@ -798,6 +798,20 @@ describe("maximum reasoning effort", () => {
     expect(isReasoningRejection("unknown parameter logprobs")).toBe(false);
   });
 
+  it("remembers the level a model accepted so later turns skip the probe", async () => {
+    const { planMaxEffort, rememberEffort, resetLearnedEffort } = await import("../src/reasoning");
+    resetLearnedEffort();
+    try {
+      expect(planMaxEffort("brand-new-model").effort).toBe("max");
+      rememberEffort("brand-new-model", "medium");
+      expect(planMaxEffort("brand-new-model")).toEqual({ effort: "medium", known: true });
+      rememberEffort("brand-new-model", undefined);
+      expect(planMaxEffort("brand-new-model")).toEqual({ effort: undefined, known: true });
+    } finally {
+      resetLearnedEffort();
+    }
+  });
+
   it("sends the effort in each dialect's own shape", async () => {
     const chat = parseChatCompletionsRequest({ model: "gpt-5.6-sol", messages: [{ role: "user", content: "hi" }], reasoning_effort: "max" });
     expect((buildZenRequestBody("chat", chat, false) as { reasoning_effort: string }).reasoning_effort).toBe("max");
@@ -833,9 +847,9 @@ describe("maximum reasoning effort", () => {
     expect(tightBody.thinking).toBeUndefined();
   });
 
-  it("defaults to 30 empty-answer retries", async () => {
+  it("defaults to 8 empty-answer retries (enough to reach the token cap)", async () => {
     const { retryPolicyFromEnv, emptyRetryDelay } = await import("../src/retry");
-    expect(retryPolicyFromEnv({}).emptyRetries).toBe(30);
+    expect(retryPolicyFromEnv({}).emptyRetries).toBe(8);
     expect(retryPolicyFromEnv({ UPSTREAM_EMPTY_RETRIES: 5 }).emptyRetries).toBe(5);
     expect(retryPolicyFromEnv({ UPSTREAM_EMPTY_RETRIES: 0 }).emptyRetries).toBe(0);
     expect(emptyRetryDelay(1)).toBeLessThan(1_000);
@@ -851,6 +865,45 @@ describe("maximum reasoning effort", () => {
     expect(
       hasUsableOutput({ id: "a", model: "m", output: [{ type: "tool_call", id: "c", name: "f", argumentsJson: "{}" }], stopReason: "end", created: 1 }),
     ).toBe(true);
+  });
+
+  it("does not retry an empty answer that ended in an upstream error", async () => {
+    const { isRetryableEmpty } = await import("../src/pipeline");
+    expect(isRetryableEmpty({ id: "a", model: "m", output: [], stopReason: "end", created: 1 })).toBe(true);
+    expect(isRetryableEmpty({ id: "a", model: "m", output: [], stopReason: "error", created: 1 })).toBe(false);
+    expect(
+      isRetryableEmpty({ id: "a", model: "m", output: [{ type: "text", text: "hi" }], stopReason: "error", created: 1 }),
+    ).toBe(false);
+  });
+});
+
+describe("upstream identity", () => {
+  it("uses one weekly fallback session instead of a fresh id per request", async () => {
+    const { weeklySessionId } = await import("../src/identity");
+    const monday = weeklySessionId(new Date("2026-10-19T00:00:00Z"));
+    const sunday = weeklySessionId(new Date("2026-10-25T23:59:59Z"));
+    const nextMonday = weeklySessionId(new Date("2026-10-26T00:00:00Z"));
+    expect(monday).toBe(sunday);
+    expect(nextMonday).not.toBe(monday);
+    expect(monday).toMatch(/^ses_conv_w\d{4}_\d{2}$/);
+  });
+
+  it("uses a stable session under the proxy project when opencode is installed", async () => {
+    const { defaultSessionId, weeklySessionId } = await import("../src/identity");
+    const project = "0f8fad5b-d9cb-469f-a165-70867728950e";
+    const date = new Date("2026-10-19T00:00:00Z");
+    expect(defaultSessionId({ OPENCODE_INSTALLED: "1", OPENCODE_PROJECT_ID: project }, date)).toBe(`ses_conv_${project}`);
+    // installed but no project id: fall through to the weekly fallback
+    expect(defaultSessionId({ OPENCODE_INSTALLED: "1" }, date)).toBe(weeklySessionId(date));
+    // not installed: weekly fallback even if a project id happens to be present
+    expect(defaultSessionId({ OPENCODE_PROJECT_ID: project }, date)).toBe(weeklySessionId(date));
+  });
+
+  it("uses the configured project id, otherwise a stable per-isolate uuid", async () => {
+    const { proxyProjectId } = await import("../src/identity");
+    const project = "0f8fad5b-d9cb-469f-a165-70867728950e";
+    expect(proxyProjectId({ OPENCODE_PROJECT_ID: project })).toBe(project);
+    expect(proxyProjectId({})).toBe(proxyProjectId({}));
   });
 });
 

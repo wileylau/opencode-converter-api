@@ -120,7 +120,10 @@ export function retryPolicyFromEnv(env: Record<string, unknown> | undefined): Re
   return {
     statusRetries: intEnv(env, "UPSTREAM_RETRIES", 3, 1, 20),
     networkRetries: intEnv(env, "UPSTREAM_NETWORK_RETRIES", 150, 1, 1000),
-    emptyRetries: intEnv(env, "UPSTREAM_EMPTY_RETRIES", 30, 0, 200),
+    // 8 retries is exactly enough to double the token budget from 2 048 to the
+    // 200 000 cap. Higher values only multiply quota-consuming generations on
+    // the shared free tier, which is what turns one empty answer into a 429.
+    emptyRetries: intEnv(env, "UPSTREAM_EMPTY_RETRIES", 8, 0, 200),
     geoBlockRetries: unboundedEnv(env, "UPSTREAM_GEOBLOCK_RETRIES", 10_000),
     statusDeadlineMs: intEnv(env, "UPSTREAM_TOTAL_DEADLINE_MS", 90_000, 1_000, 3_600_000),
     networkDeadlineMs: intEnv(env, "UPSTREAM_NETWORK_DEADLINE_MS", 900_000, 1_000, 3_600_000),

@@ -22,7 +22,7 @@ import {
   sleep,
   statusRetryDelay,
 } from "./retry";
-import { isReasoningRejection, lowerEffort, planMaxEffort, type Effort } from "./reasoning";
+import { isReasoningRejection, lowerEffort, planMaxEffort, rememberEffort, type Effort } from "./reasoning";
 
 /** tool_choice repair + one step per reasoning level */
 const MAX_REPAIR_PASSES = 8;
@@ -191,6 +191,15 @@ export function hasUsableOutput(c: CanonicalResponse): boolean {
   );
 }
 
+/**
+ * An empty *successful* answer is worth another roll of the dice. An answer that
+ * ended in an upstream error is not: retrying it just repeats the same failure
+ * (and burns the shared anonymous quota), so return the error to the client.
+ */
+export function isRetryableEmpty(c: CanonicalResponse): boolean {
+  return !hasUsableOutput(c) && c.stopReason !== "error";
+}
+
 /** Streaming counterpart: emits the buffered reasoning as text just before stop. */
 export function makeEmptyStreamGuard(): (ev: CanonicalEvent) => CanonicalEvent[] {
   let reasoning = "";
@@ -256,7 +265,7 @@ function humanizeUpstreamError(err: ZenError, attempts: number, reconnects = 0):
   if (!rateLimited) return err.message;
   const hint = err.message.includes("api key")
     ? ""
-    : " Anonymous free-tier quota is shared and refills continuously — send your own zen API key (Authorization: Bearer <key>) for a dedicated quota, or retry shortly.";
+    : " Anonymous free-tier quota is shared — anything else on this machine/IP using the anonymous tier (for example the opencode CLI) drains the same pool. Send your own zen API key (Authorization: Bearer <key>) for a dedicated quota, or retry shortly.";
   const retried = attempts > 1 ? ` (retried ${attempts - 1}×)` : "";
   const reconnected = reconnects > 0 ? ` (reconnected ${reconnects}×)` : "";
   return `${err.message}${hint}${retried}${reconnected}`;
@@ -362,10 +371,12 @@ export async function handleCompletion(h: HandlerEnv): Promise<Response> {
 
     // Repair pass: some zen model families reject specific mapped params (e.g.
     // muse rejects forced tool_choice). On a recognizable 400, rebuild once.
+    // The retry budgets live outside the pass loop so a repair cannot reset
+    // them: one inbound turn must not multiply into unlimited upstream calls.
+    const reconnectBudget: ReconnectBudget = { used: 0 };
+    /** attempts spent because the model answered with nothing usable */
+    const emptyBudget: ReconnectBudget = { used: 0 };
     for (let pass = 0; ; pass++) {
-      const reconnectBudget: ReconnectBudget = { used: 0 };
-      /** attempts spent because the model answered with nothing usable */
-      const emptyBudget: ReconnectBudget = { used: 0 };
       const zenCallOptions = {
         auth: { apiKey: h.auth.apiKey, anonymous: !h.auth.apiKey },
         body: bodyStr,
@@ -462,7 +473,7 @@ export async function handleCompletion(h: HandlerEnv): Promise<Response> {
 
       // The model can be perfectly healthy and still return nothing usable
       // (all tokens burned on internal thinking). Retry with a bigger budget.
-      while (!hasUsableOutput(canonical) && emptyBudget.used < policy.emptyRetries && !h.signal?.aborted) {
+      while (isRetryableEmpty(canonical) && emptyBudget.used < policy.emptyRetries && !h.signal?.aborted) {
         emptyBudget.used += 1;
         escalateTokenBudget();
         await sleep(emptyRetryDelay(emptyBudget.used));
@@ -789,6 +800,9 @@ function repairRequest(req: CanonicalRequest, err: ZenError): CanonicalRequest |
   if (err.status !== 400) return null;
   if (isReasoningRejection(msg) && req.reasoningEffort) {
     const next = lowerEffort(req.reasoningEffort as Effort);
+    // Remember it for this model so the next turn starts where this one landed
+    // instead of paying the whole max → none probe chain again.
+    rememberEffort(req.model, next);
     return { ...req, reasoningEffort: next };
   }
   if (/tool_choice/i.test(msg) && req.toolChoice !== "auto") {
